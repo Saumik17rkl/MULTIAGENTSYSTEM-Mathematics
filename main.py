@@ -1,4 +1,5 @@
 import os
+import uuid
 from typing import Dict, Any, List
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
@@ -19,17 +20,17 @@ load_dotenv()
 app = Flask(__name__)
 
 CONFIDENCE_THRESHOLD = 0.85
+ALLOWED_HITL_ACTIONS = {"approve", "reject", "edit_problem", "correct_solution"}
+TERMINAL_STATES = {"RESOLVED"}
 
+# Temporary in-memory HITL store
+HITL_STORE: Dict[str, Dict[str, Any]] = {}
 
 # --------------------------------------------------
 # MULTI-AGENT SYSTEM
 # --------------------------------------------------
 
 class MultiAgentSystem:
-    """
-    Orchestrates the multi-agent math reasoning pipeline.
-    Responsible ONLY for control flow and safety.
-    """
 
     def __init__(self, llm_provider: str = "auto"):
         self.llm = self._initialize_llm(llm_provider)
@@ -42,168 +43,225 @@ class MultiAgentSystem:
 
     def _initialize_llm(self, provider: str):
         provider = provider.lower()
-
-        # Try Gemini first
         if provider in ("gemini", "auto"):
             try:
                 gemini = GeminiClient()
-                test = gemini.generate("ping")
-                if test.get("success"):
-                    print("✅ Using Gemini as primary LLM")
+                if gemini.generate("ping").get("success"):
                     return gemini
-                print("⚠️ Gemini failed, falling back to Groq")
-            except Exception as e:
-                print(f"⚠️ Gemini init error: {str(e)[:120]}")
+            except Exception:
+                pass
+        return GroqClient(model_name="llama-3.3-70b-versatile")
 
-        # Fallback to Groq
-        groq = GroqClient(model_name="llama-3.3-70b-versatile")
-        print("✅ Using Groq as fallback LLM")
-        return groq
+    # --------------------------------------------------
+    # PRIMARY PIPELINE
+    # --------------------------------------------------
 
     def process_problem(self, problem_data: Dict[str, Any]) -> Dict[str, Any]:
         agent_trace: List[Dict[str, Any]] = []
 
-        try:
-            # 1️⃣ Intent Routing
-            route_info = self.intent_router.route(problem_data)
-            agent_trace.append({"agent": "IntentRouter", "output": route_info})
+        route_info = self.intent_router.route(problem_data)
+        agent_trace.append({"agent": "IntentRouter", "output": route_info})
 
-            if route_info["route"] == "out_of_scope":
-                return {
-                    "status": "OUT_OF_SCOPE",
-                    "reason": route_info.get("reason", "Unsupported problem"),
-                    "agent_trace": agent_trace
+        if route_info["route"] == "out_of_scope":
+            return {"status": "OUT_OF_SCOPE", "agent_trace": agent_trace}
+
+        solver_result = self.solver.solve(
+            problem_text=problem_data["problem_text"],
+            route=route_info["route"],
+            difficulty=route_info["difficulty"],
+            tools_allowed=route_info.get("tools_allowed", []),
+            rag_context=problem_data.get("retrieved_context", [])
+        )
+        agent_trace.append({"agent": "Solver", "output": solver_result})
+
+        if solver_result.get("status") != "SOLVED":
+            return {"status": "FAILED", "agent_trace": agent_trace}
+
+        verification = self.verifier.verify(
+            problem_text=problem_data["problem_text"],
+            solution=solver_result,
+            route=route_info["route"]
+        )
+        agent_trace.append({"agent": "Verifier", "output": verification})
+
+        if (
+            verification.get("verdict") != "correct"
+            or verification.get("confidence", 0.0) < CONFIDENCE_THRESHOLD
+            or verification.get("requires_hitl", False)
+        ):
+            hitl_id = str(uuid.uuid4())
+
+            HITL_STORE[hitl_id] = {
+                "state": "PENDING_REVIEW",
+                "problem_data": problem_data,
+                "solution": solver_result,
+                "verification": verification,
+                "agent_trace": agent_trace,
+                "hitl_reason": {
+                    "verdict": verification.get("verdict"),
+                    "confidence": verification.get("confidence"),
+                    "requires_hitl": verification.get("requires_hitl", False)
                 }
+            }
 
-            # 2️⃣ Solve
-            solution = self.solver.solve(
-                problem_text=problem_data["problem_text"],
-                route=route_info["route"],
-                difficulty=route_info["difficulty"],
-                tools_allowed=route_info.get("tools_allowed", []),
-                rag_context=problem_data.get("retrieved_context", [])
-            )
-            agent_trace.append({"agent": "Solver", "output": solution})
+            return {
+                "status": "HITL_REQUIRED",
+                "hitl_request_id": hitl_id,
+                "hitl_reason": HITL_STORE[hitl_id]["hitl_reason"]
+            }
 
-            if solution.get("status") != "SOLVED":
-                return {
-                    "status": "FAILED",
-                    "reason": solution.get("reason", "Solver failed"),
-                    "agent_trace": agent_trace
-                }
+        explanation = self.explainer.explain(
+            problem_text=problem_data["problem_text"],
+            verified_solution=solver_result,
+            verification_confidence=verification["confidence"]
+        )
 
-            # 3️⃣ Verify
-            verification = self.verifier.verify(
-                problem_text=problem_data["problem_text"],
-                solution=solution,
-                route=route_info["route"]
-            )
-            agent_trace.append({"agent": "Verifier", "output": verification})
+        return {
+            "status": "SUCCESS",
+            "final_answer": solver_result["final_answer"],
+            "steps": solver_result["steps"],
+            "explanation": explanation,
+            "confidence": verification["confidence"],
+            "agent_trace": agent_trace
+        }
 
-            if (
-                verification["verdict"] != "correct"
-                or verification["confidence"] < CONFIDENCE_THRESHOLD
-            ):
-                return {
-                    "status": "HITL_REQUIRED",
-                    "reason": verification,
-                    "proposed_solution": solution,
-                    "agent_trace": agent_trace
-                }
+    # --------------------------------------------------
+    # HITL RESUME
+    # --------------------------------------------------
 
-            # 4️⃣ Explain
+    def resume_from_hitl(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        hitl_id = payload["hitl_request_id"]
+        action = payload["action"]
+
+        if action not in ALLOWED_HITL_ACTIONS:
+            return {"status": "ERROR", "error": "Invalid HITL action"}
+
+        record = HITL_STORE.get(hitl_id)
+
+        if not record:
+            return {"status": "ERROR", "error": "Invalid HITL request ID"}
+
+        if record["state"] in TERMINAL_STATES:
+            return {
+                "status": "ERROR",
+                "error": f"HITL request already resolved (state={record['state']})"
+            }
+
+        if action == "approve":
             explanation = self.explainer.explain(
-                problem_text=problem_data["problem_text"],
-                verified_solution=solution,
-                verification_confidence=verification["confidence"]
+                problem_text=record["problem_data"]["problem_text"],
+                verified_solution=record["solution"],
+                verification_confidence=record["verification"]["confidence"]
             )
-            agent_trace.append({"agent": "Explainer", "output": explanation})
+            record["state"] = "RESOLVED"
+            return {
+                "status": "SUCCESS",
+                "final_answer": record["solution"]["final_answer"],
+                "steps": record["solution"]["steps"],
+                "explanation": explanation,
+                "confidence": record["verification"]["confidence"]
+            }
+
+        if action == "reject":
+            record["state"] = "RESOLVED"
+            return {"status": "REJECTED"}
+
+        if action == "edit_problem":
+            edited_text = payload.get("edited_problem_text")
+            if not edited_text:
+                return {"status": "ERROR", "error": "edited_problem_text required"}
+
+            record["problem_data"]["problem_text"] = edited_text
+            record["state"] = "RESOLVED"
+            record["resolution_type"] = "EDITED_PROBLEM"
+
+            return {
+                "status": "NEEDS_RERUN",
+                "updated_problem_data": record["problem_data"],
+                "instruction": "Re-run pipeline from IntentRouter"
+            }
+
+
+        if action == "correct_solution":
+            corrected = payload.get("corrected_solution")
+            if not corrected:
+                return {"status": "ERROR", "error": "corrected_solution required"}
+
+            required_fields = {"final_answer", "steps"}
+            if not required_fields.issubset(corrected):
+                return {
+                    "status": "ERROR",
+                    "error": "corrected_solution must include final_answer and steps"
+                }
+
+            explanation = self.explainer.explain(
+                problem_text=record["problem_data"]["problem_text"],
+                verified_solution=corrected,
+                verification_confidence=1.0
+            )
+            record["state"] = "RESOLVED"
+            record["resolution_type"] = "EDITED_PROBLEM"
 
             return {
                 "status": "SUCCESS",
-                "final_answer": solution["final_answer"],
-                "steps": solution["steps"],
+                "final_answer": corrected.get("final_answer"),
+                "steps": corrected.get("steps"),
                 "explanation": explanation,
-                "confidence": verification["confidence"],
-                "agent_trace": agent_trace
+                "confidence": 1.0
             }
 
-        except Exception as e:
-            return {
-                "status": "ERROR",
-                "error": str(e),
-                "agent_trace": agent_trace
-            }
-
-
 # --------------------------------------------------
-# GLOBAL SYSTEM (INIT ONCE)
+# GLOBAL SYSTEM
 # --------------------------------------------------
+def cleanup_hitl_store():
+    """
+    Placeholder for TTL / DB cleanup.
+    In production, resolved HITL records should expire.
+    """
+    pass
 
 system = MultiAgentSystem(llm_provider="auto")
-
 
 # --------------------------------------------------
 # ROUTES
 # --------------------------------------------------
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET"]) 
 def index():
-    return """<pre>
-Math Reasoning System
-====================
-
-A multi-agent system for solving mathematical problems.
-
-Available Routes:
-  GET  /health  - Check service health
-  POST /solve   - Submit a math problem (requires JSON payload)
-  
-Example request:
-  POST /solve
-  {
-    "problem_text": "Solve 2x + 5 = 15",
-    "topic": "algebra",
-    "variables": ["x"],
-    "retrieved_context": []
-  }
-</pre>"""
-
+    return """<pre> Math Reasoning System ==================== A multi-agent system for solving mathematical problems. 
+    Available Routes: GET /health - Check service health 
+    POST /solve - Submit a math problem (requires JSON payload) 
+    Example request: POST /solve { "problem_text": "Solve 2x + 5 = 15", "topic": "algebra", "variables": ["x"], "retrieved_context": [] } </pre>"""
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "healthy",
-        "llm_provider": system.llm.__class__.__name__
-    }), 200
-
+    return jsonify({"status": "healthy"}), 200
 
 @app.route("/solve", methods=["POST"])
 def solve():
     if not request.is_json:
-        return jsonify({
-            "status": "error",
-            "error": "Request must be JSON"
-        }), 400
+        return jsonify({"error": "JSON required"}), 400
 
     data = request.get_json()
 
-    if "problem_text" not in data or not isinstance(data["problem_text"], str):
-        return jsonify({
-            "status": "error",
-            "error": "Field 'problem_text' (string) is required"
-        }), 400
+    if "problem_text" not in data:
+        return jsonify({"error": "problem_text is required"}), 400
 
-    problem_data = {
-        "problem_text": data["problem_text"],
-        "topic": data.get("topic", ""),
-        "variables": data.get("variables", []),
-        "constraints": data.get("constraints", []),
-        "retrieved_context": data.get("retrieved_context", [])
-    }
+    return jsonify(system.process_problem(data)), 200
 
-    result = system.process_problem(problem_data)
-    return jsonify(result), 200
+
+@app.route("/hitl/resolve", methods=["POST"])
+def hitl_resolve():
+    if not request.is_json:
+        return jsonify({"error": "JSON required"}), 400
+
+    payload = request.get_json()
+
+    if not {"hitl_request_id", "action"}.issubset(payload):
+        return jsonify({"error": "Missing HITL fields"}), 400
+
+    return jsonify(system.resume_from_hitl(payload)), 200
+
 
 
 # --------------------------------------------------
@@ -213,5 +271,4 @@ def solve():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
-
     app.run(host="0.0.0.0", port=port, debug=debug)

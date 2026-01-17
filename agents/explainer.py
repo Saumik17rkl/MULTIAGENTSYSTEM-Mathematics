@@ -4,8 +4,13 @@ import json
 
 class ExplainerAgent:
     """
-    Explains a VERIFIED solution in a student-friendly manner.
-    This agent must NEVER re-solve or modify the solution.
+    Explains a VERIFIED and APPROVED solution.
+
+    ABSOLUTE CONSTRAINTS:
+    - Never re-solve
+    - Never modify steps
+    - Never introduce new reasoning
+    - Never decide correctness
     """
 
     def __init__(self, llm, style: str = "friendly"):
@@ -15,141 +20,152 @@ class ExplainerAgent:
     def _create_prompt(
         self,
         problem_text: str,
-        verified_solution: Dict[str, Any],
-        verification_confidence: float
+        verified_solution: Dict[str, Any]
     ) -> str:
         style_instructions = {
-            "friendly": "Use a friendly, conversational tone.",
+            "friendly": "Use a friendly, student-friendly tone.",
             "formal": "Use a formal, academic tone.",
-            "concise": "Be brief but clear.",
-            "detailed": "Provide thorough explanations with helpful context."
-        }.get(self.style, "Use a clear and professional tone.")
+            "concise": "Be brief and precise.",
+            "detailed": "Explain carefully without adding new logic."
+        }.get(self.style, "Use a clear and neutral tone.")
 
-        steps = "\n".join(
-            f"{i+1}. {step}"
-            for i, step in enumerate(verified_solution.get("steps", []))
+        steps: List[str] = verified_solution.get("steps", [])
+
+        formatted_steps = "\n".join(
+            f"{i+1}. {step}" for i, step in enumerate(steps)
         )
 
         return f"""
-            You are an Explainer Agent.
+You are an Explainer Agent.
 
-            Your ONLY job is to explain the reasoning behind an ALREADY VERIFIED solution.
+The solution below has ALREADY BEEN:
+- verified by a Verifier Agent
+- optionally approved or corrected by a human
 
-            ABSOLUTE RULES (NON-NEGOTIABLE):
-            1. DO NOT re-solve the problem under any circumstance.
-            2. DO NOT modify, correct, optimize, or reinterpret any step.
-            3. DO NOT add new steps, assumptions, examples, or alternative approaches.
-            4. DO NOT infer missing logic or "fix" unclear reasoning.
-            5. DO NOT contradict the verified solution, even if it appears wrong.
-            6. DO NOT introduce external knowledge beyond what is strictly required to explain WHY a step works.
-            7. DO NOT restate the final answer in a different form.
+You MUST treat it as ground truth.
 
-            STRICT SCOPE:
-            - You may ONLY explain the steps exactly as provided.
-            - Each explanation must answer: "Why does this step logically follow?"
-            - If a step is unclear or jumps logic, explain the underlying principle that makes it valid — NOT what should have been done instead.
-            - If a step relies on a known concept, name the concept, but do not derive or expand it.
+────────────────────────────────────────
+NON-NEGOTIABLE RULES
+────────────────────────────────────────
+1. DO NOT re-solve the problem.
+2. DO NOT modify, reorder, or reinterpret steps.
+3. DO NOT add assumptions, examples, or alternatives.
+4. DO NOT fix unclear reasoning.
+5. DO NOT contradict the provided steps.
+6. DO NOT restate or reformat the final answer.
+7. DO NOT introduce external knowledge unless explicitly required to explain WHY a step works.
 
-            TONE & STYLE:
-            {style_instructions}
+────────────────────────────────────────
+SCOPE OF EXPLANATION
+────────────────────────────────────────
+- Explain EACH step EXACTLY as provided.
+- One explanation per step.
+- Explanation answers ONLY: "Why does this step logically follow?"
+- If a step relies on a known concept, name it briefly. Do NOT derive it.
 
-            CONTEXT GUARANTEES:
-            - The solution has already been VERIFIED.
-            - Verification confidence: {verification_confidence}
-            - Treat the solution as ground truth.
+────────────────────────────────────────
+TONE
+────────────────────────────────────────
+{style_instructions}
 
-            INPUTS:
-            Problem:
-            {problem_text}
+────────────────────────────────────────
+INPUT
+────────────────────────────────────────
+Problem:
+{problem_text}
 
-            Verified Solution Steps:
-            {steps}
+Verified Steps:
+{formatted_steps}
 
-            Final Answer (DO NOT MODIFY OR REPHRASE):
-            {verified_solution.get("final_answer", "Not provided")}
+Final Answer (READ-ONLY):
+{verified_solution.get("final_answer", "")}
 
-            OUTPUT CONSTRAINTS:
-            - Return VALID JSON ONLY.
-            - No markdown.
-            - No extra keys.
-            - No prose outside JSON.
-            - Each explanation must map ONE-TO-ONE with the provided steps.
+────────────────────────────────────────
+OUTPUT RULES
+────────────────────────────────────────
+- Output VALID JSON only.
+- No markdown.
+- No extra keys.
+- explanation.length MUST equal number of steps.
+- If compliance is impossible, return EMPTY ARRAYS.
 
-            OUTPUT FORMAT (STRICT):
-            {{
-            "explanation": [
-                "Why step 1 works...",
-                "Why step 2 works..."
-            ],
-            "key_concepts": [
-                "Concept explicitly used in the steps only"
-            ],
-            "common_mistakes": [
-                "Mistakes people make when misunderstanding THESE steps (not alternative methods)"
-            ]
-            }}
+────────────────────────────────────────
+OUTPUT FORMAT (STRICT)
+────────────────────────────────────────
+{{
+  "explanation": [
+    "Why step 1 works...",
+    "Why step 2 works..."
+  ],
+  "key_concepts": [
+    "Only concepts explicitly used in the steps"
+  ],
+  "common_mistakes": [
+    "Misunderstandings related ONLY to these steps"
+  ]
+}}
 
-            FAILURE MODE:
-            If you cannot comply with ANY rule above, return:
-            {{
-            "explanation": [],
-            "key_concepts": [],
-            "common_mistakes": []
-            }}
-
+FAILURE MODE:
+{{
+  "explanation": [],
+  "key_concepts": [],
+  "common_mistakes": []
+}}
 """
 
     def explain(
         self,
         problem_text: str,
         verified_solution: Dict[str, Any],
-        verification_confidence: float
+        verification_confidence: float = 1.0
     ) -> Dict[str, Any]:
+        """
+        NOTE:
+        verification_confidence is accepted for logging only.
+        It MUST NOT affect execution.
+        """
 
-        if verification_confidence < 0.85:
-            raise ValueError(
-                "ExplainerAgent should not run on low-confidence solutions"
-            )
+        steps = verified_solution.get("steps", [])
 
-        prompt = self._create_prompt(
-            problem_text,
-            verified_solution,
-            verification_confidence
-        )
+        if not isinstance(steps, list):
+            return {
+                "explanation": [],
+                "key_concepts": [],
+                "common_mistakes": []
+            }
 
-        response = self.llm.generate(prompt, temperature=0.3)
+        prompt = self._create_prompt(problem_text, verified_solution)
+        response = self.llm.generate(prompt, temperature=0.2)
 
         try:
-            if isinstance(response, str):
-                parsed = json.loads(response)
-            else:
-                parsed = response
+            parsed = (
+                json.loads(response)
+                if isinstance(response, str)
+                else response
+            )
 
             explanation = parsed.get("explanation", [])
             key_concepts = parsed.get("key_concepts", [])
             common_mistakes = parsed.get("common_mistakes", [])
 
-            # Normalize outputs
-            if isinstance(explanation, str):
-                explanation = [explanation]
+            # HARD VALIDATION: 1-to-1 mapping
+            if not isinstance(explanation, list) or len(explanation) != len(steps):
+                return {
+                    "explanation": [],
+                    "key_concepts": [],
+                    "common_mistakes": []
+                }
 
             return {
                 "explanation": explanation,
-                "key_concepts": key_concepts,
-                "common_mistakes": common_mistakes
+                "key_concepts": key_concepts if isinstance(key_concepts, list) else [],
+                "common_mistakes": common_mistakes if isinstance(common_mistakes, list) else []
             }
 
         except Exception:
-            # Honest fallback — do not pretend completeness
+            # In HITL systems, silence > hallucination
             return {
-                "explanation": [
-                    "A complete explanation could not be generated reliably.",
-                    "Below is a high-level walkthrough of the verified steps:"
-                ] + [
-                    f"- {step}" for step in verified_solution.get("steps", [])
-                ],
+                "explanation": [],
                 "key_concepts": [],
-                "common_mistakes": [
-                    "Detailed explanation unavailable due to generation error"
-                ]
+                "common_mistakes": []
             }

@@ -5,7 +5,12 @@ import json
 class IntentRouter:
     """
     Classifies a parsed math problem into a solver route.
-    This agent MUST NOT solve or explain.
+
+    RULES:
+    - Never solve
+    - Never explain
+    - Never transform the problem
+    - Only classify intent
     """
 
     VALID_ROUTES = {
@@ -14,78 +19,60 @@ class IntentRouter:
         "calculus_limit",
         "calculus_derivative",
         "calculus_optimization",
-        "linear_algebra_basic"
+        "linear_algebra_basic",
+        "out_of_scope"
     }
 
-    VALID_DIFFICULTIES = {"easy", "medium", "hard"}
-
-    VALID_TOOLS = {"python"}
+    VALID_DIFFICULTIES = {"easy", "medium", "hard", "unknown"}
 
     def __init__(self, llm):
         self.llm = llm
+
+    # --------------------------------------------------
+    # PROMPT
+    # --------------------------------------------------
 
     def _create_prompt(self, problem_data: Dict[str, Any]) -> str:
         return f"""
 You are an Intent Router Agent.
 
-Your ONLY responsibility is to classify the given problem into ONE predefined route.
-You are NOT allowed to solve, analyze, transform, rephrase, or explain the problem.
+Your ONLY task is to classify the problem into ONE predefined route.
+You must NOT solve, explain, rewrite, or analyze the problem.
 
-────────────────────
-ALLOWED ROUTES (EXACT MATCH ONLY)
-────────────────────
+ALLOWED ROUTES (EXACT MATCH ONLY):
 - algebra_equation
 - probability_basic
 - calculus_limit
 - calculus_derivative
 - calculus_optimization
 - linear_algebra_basic
+- out_of_scope
 
-DO NOT create new routes.
-DO NOT combine routes.
-DO NOT infer advanced topics beyond the listed routes.
+CLASSIFICATION RULES:
+1. Choose the single dominant mathematical intent.
+2. If intent is unclear, mixed, or outside scope → out_of_scope.
+3. Difficulty is a rough estimate:
+   - easy / medium / hard
+   - use unknown if unsure.
 
-────────────────────
-CLASSIFICATION RULES
-────────────────────
-1. Choose the SINGLE most dominant mathematical intent.
-2. If multiple topics appear, select the PRIMARY objective, not supporting concepts.
-3. If the problem requires:
-   - solving equations → algebra_equation
-   - basic probability rules, counting, conditional probability → probability_basic
-   - evaluating limits → calculus_limit
-   - finding derivatives (explicit or implicit) → calculus_derivative
-   - maximizing/minimizing quantities → calculus_optimization
-   - vectors, matrices, determinants, systems, eigen concepts → linear_algebra_basic
-4. If the intent is unclear, mixed beyond scope, non-mathematical, or outside these domains → out_of_scope.
+FORBIDDEN:
+- No explanations
+- No reasoning
+- No extra keys
+- No text outside JSON
 
-────────────────────
-FORBIDDEN BEHAVIOR
-────────────────────
-- DO NOT solve the problem.
-- DO NOT explain your choice.
-- DO NOT add commentary or reasoning.
-- DO NOT modify or reinterpret the problem.
-- DO NOT output anything other than valid JSON.
-
-────────────────────
-OUTPUT FORMAT (STRICT)
-────────────────────
-Return ONLY valid JSON in this exact structure:
-
-{
-  "route": "<one_of_the_allowed_routes_or_out_of_scope>",
-  "difficulty": "<easy | medium | hard | unknown>",
+OUTPUT FORMAT (STRICT JSON):
+{{
+  "route": "<allowed_route>",
+  "difficulty": "<easy|medium|hard|unknown>",
   "tools_allowed": []
-}
+}}
 
-────────────────────
-INPUT
-────────────────────
+INPUT:
 Problem:
 {problem_data.get("problem_text", "")}
 
-Topic:
+Topic (from parser):
 {problem_data.get("topic", "unknown")}
 
 Variables:
@@ -93,15 +80,18 @@ Variables:
 
 Constraints:
 {problem_data.get("constraints", [])}
-
-JSON:
-
 """
+
+    # --------------------------------------------------
+    # PRIMARY ROUTING LOGIC
+    # --------------------------------------------------
 
     def route(self, problem_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Route based on Parser Agent output.
-        LLM routing is fallback only.
+        Routing priority:
+        1. Trust Parser Agent if topic is clean
+        2. Fallback to LLM classification
+        3. Fail closed (out_of_scope)
         """
 
         topic = problem_data.get("topic")
@@ -109,25 +99,19 @@ JSON:
         TOPIC_TO_ROUTE = {
             "algebra": "algebra_equation",
             "probability": "probability_basic",
-            "calculus": "calculus_derivative",
+            "calculus_limit": "calculus_limit",
+            "calculus_derivative": "calculus_derivative",
+            "calculus_optimization": "calculus_optimization",
             "linear_algebra": "linear_algebra_basic"
         }
 
-        # ✅ PRIMARY: TRUST PARSER AGENT
-        if topic in TOPIC_TO_ROUTE:
+        # ✅ PRIMARY: Parser Agent authority
+        if isinstance(topic, str) and topic in TOPIC_TO_ROUTE:
             return {
                 "route": TOPIC_TO_ROUTE[topic],
                 "difficulty": "medium",
-                "tools_allowed": ["python"]
+                "tools_allowed": []
             }
 
-        # ❌ ONLY IF PARSER FAILED → LLM ROUTING
-        return self._llm_route(problem_data)
-
-    def _out_of_scope(self, reason: str) -> Dict[str, Any]:
-        return {
-            "route": "out_of_scope",
-            "difficulty": "unknown",
-            "tools_allowed": [],
-            "reason": reason
-        }
+        # 🔁 FALLBACK: LLM-based routing
+        return self._llm_

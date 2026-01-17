@@ -3,13 +3,26 @@ from typing import Dict, Any, List
 
 class VerifierAgent:
     """
-    Verifies correctness of solver output.
-    This agent NEVER solves or fixes the problem.
+    Evaluates correctness of a candidate solution.
+
+    AUTHORITY:
+    - Judges correctness
+    - Estimates confidence
+    - Flags uncertainty
+
+    RESTRICTIONS:
+    - NEVER solve
+    - NEVER fix
+    - NEVER rewrite steps
     """
 
     def __init__(self, llm, confidence_threshold: float = 0.85):
         self.llm = llm
         self.confidence_threshold = confidence_threshold
+
+    # --------------------------------------------------
+    # PROMPT
+    # --------------------------------------------------
 
     def _create_prompt(
         self,
@@ -18,40 +31,61 @@ class VerifierAgent:
         route: str
     ) -> str:
 
+        steps = solution.get("steps", [])
+
         steps_text = "\n".join(
-            f"- {step}" for step in solution.get("steps", [])
+            f"{i+1}. {step}" for i, step in enumerate(steps)
         )
 
         return f"""
 You are a Verifier Agent.
 
-Your task is to evaluate whether the proposed solution is correct.
+Your ONLY task is to evaluate whether the proposed solution is correct.
 
-Rules:
-- Do NOT solve the problem again.
-- Do NOT suggest alternative solutions.
-- Only evaluate correctness.
-- Be strict but fair.
+STRICT RULES:
+- DO NOT solve the problem.
+- DO NOT suggest fixes or alternatives.
+- DO NOT add steps.
+- DO NOT rewrite reasoning.
+- Only judge correctness and uncertainty.
 
-Problem Route:
+EVALUATION CRITERIA:
+- Logical correctness of each step
+- Correct use of definitions, formulas, and constraints
+- Consistency between steps and final answer
+- Domain validity (no illegal operations)
+
+PROBLEM ROUTE:
 {route}
 
-Problem:
+PROBLEM:
 {problem_text}
 
-Proposed Steps:
+PROPOSED STEPS:
 {steps_text}
 
-Final Answer:
-{solution.get("final_answer")}
+FINAL ANSWER:
+{solution.get("final_answer", "")}
 
-Return ONLY valid JSON in this EXACT format:
+OUTPUT FORMAT (STRICT JSON ONLY):
 {{
-  "verdict": "correct or incorrect or uncertain",
+  "verdict": "correct | incorrect | uncertain",
   "confidence": 0.0,
-  "issues": ["concise, step-referenced issues only"]
+  "issues": [
+    "Step-referenced, concise issues only"
+  ]
 }}
+
+IMPORTANT:
+- confidence MUST be between 0.0 and 1.0
+- If unsure, use verdict = "uncertain"
+- If incorrect, list the exact step(s) involved
+- No text outside JSON
 """
+
+    # --------------------------------------------------
+    # VERIFICATION
+    # --------------------------------------------------
 
     def verify(
         self,
@@ -60,36 +94,27 @@ Return ONLY valid JSON in this EXACT format:
         route: str
     ) -> Dict[str, Any]:
 
-        # 🚨 Solver failure → no verifier escalation
-        if solution.get("status") != "SOLVED":
-            return {
-                "verdict": "uncertain",
-                "confidence": 0.0,
-                "issues": ["Solver did not produce a valid solution"],
-                "needs_hitl": False
-            }
+        # 🚨 Hard validation: solution structure
+        if not isinstance(solution, dict):
+            return self._fail_closed("Invalid solution structure")
+
+        if not isinstance(solution.get("final_answer"), str):
+            return self._fail_closed("Missing or invalid final_answer")
+
+        if not isinstance(solution.get("steps"), list):
+            return self._fail_closed("Missing or invalid steps")
 
         prompt = self._create_prompt(problem_text, solution, route)
         llm_response = self.llm.generate(prompt, temperature=0.1)
 
-        # 🚨 LLM failure
+        # 🚨 LLM failure → require HITL
         if not llm_response.get("success"):
-            return {
-                "verdict": "uncertain",
-                "confidence": 0.0,
-                "issues": ["Verifier LLM call failed"],
-                "needs_hitl": True
-            }
+            return self._fail_closed("Verifier LLM call failed")
 
         data = llm_response.get("parsed_json")
 
         if not isinstance(data, dict):
-            return {
-                "verdict": "uncertain",
-                "confidence": 0.0,
-                "issues": ["Verifier returned invalid JSON"],
-                "needs_hitl": True
-            }
+            return self._fail_closed("Verifier returned invalid JSON")
 
         verdict = data.get("verdict", "uncertain")
         confidence = data.get("confidence", 0.0)
@@ -101,7 +126,15 @@ Return ONLY valid JSON in this EXACT format:
         except Exception:
             confidence = 0.0
 
-        needs_hitl = (
+        # Normalize verdict
+        if verdict not in {"correct", "incorrect", "uncertain"}:
+            verdict = "uncertain"
+
+        # Normalize issues
+        if not isinstance(issues, list):
+            issues = ["Invalid issues format returned by verifier"]
+
+        requires_hitl = (
             verdict != "correct"
             or confidence < self.confidence_threshold
         )
@@ -110,5 +143,20 @@ Return ONLY valid JSON in this EXACT format:
             "verdict": verdict,
             "confidence": confidence,
             "issues": issues,
-            "needs_hitl": needs_hitl
+            "requires_hitl": requires_hitl
+        }
+
+    # --------------------------------------------------
+    # FAIL CLOSED
+    # --------------------------------------------------
+
+    def _fail_closed(self, reason: str) -> Dict[str, Any]:
+        """
+        Any verifier failure MUST require HITL.
+        """
+        return {
+            "verdict": "uncertain",
+            "confidence": 0.0,
+            "issues": [reason],
+            "requires_hitl": True
         }

@@ -1,12 +1,15 @@
 from typing import Dict, Any, List, Optional
-import json
 from tools.python_tool import PythonTool
 
 
 class SolverAgent:
     """
-    Solves a structured math problem using bounded reasoning.
-    This agent MAY be wrong. The Verifier exists to judge correctness.
+    Produces a candidate solution for a structured math problem.
+
+    IMPORTANT:
+    - This agent does NOT decide correctness.
+    - This agent does NOT finalize answers.
+    - All outputs are subject to verification and human review.
     """
 
     def __init__(self, llm, python_tool: Optional[PythonTool] = None):
@@ -25,77 +28,71 @@ class SolverAgent:
         context = "\n".join(rag_context) if rag_context else "No external context provided."
 
         return f"""
-            You are a deterministic Solver Agent.
+You are a deterministic Solver Agent.
 
-            Your sole responsibility is to solve the given problem and return a response
-            that STRICTLY conforms to the required JSON schema.
+Your responsibility is to generate a *candidate solution*.
+You are allowed to be wrong. A Verifier will judge correctness.
 
-            ────────────────────────────────────────
-            STRICT OUTPUT GUARANTEES (NON-NEGOTIABLE)
-            ────────────────────────────────────────
-            1. Output MUST be valid, parseable JSON.
-            2. Output MUST contain exactly these top-level keys:
-            - "final_answer"
-            - "steps"
-            - "tool_requests"
-            3. No extra keys. No missing keys. No comments.
-            4. Do NOT include markdown, explanations, or text outside JSON.
-            5. If any rule cannot be satisfied, return:
-            {{
-                "final_answer": "",
-                "steps": [],
-                "tool_requests": []
-            }}
+────────────────────────────────────────
+STRICT OUTPUT GUARANTEES (NON-NEGOTIABLE)
+────────────────────────────────────────
+1. Output MUST be valid JSON.
+2. Output MUST contain EXACTLY these keys:
+   - "final_answer"
+   - "steps"
+   - "tool_requests"
+3. NO extra keys. NO missing keys.
+4. NO markdown. NO commentary. NO text outside JSON.
+5. If rules cannot be satisfied, return:
+{{
+  "final_answer": "",
+  "steps": [],
+  "tool_requests": []
+}}
 
-            ────────────────────────────────────────
-            STEPS FIELD RULES (CRITICAL)
-            ────────────────────────────────────────
-            - "steps" MUST be a JSON ARRAY.
-            - Each element MUST be a STRING.
-            - Each string MUST describe ONE atomic reasoning step.
-            - DO NOT combine multiple actions in one step.
-            - DO NOT return steps as paragraphs or bullet-like text.
-            - DO NOT expose hidden chain-of-thought or speculative reasoning.
-            - If the reasoning cannot be safely decomposed into clear steps,
-            return an EMPTY ARRAY.
+────────────────────────────────────────
+STEPS FIELD RULES
+────────────────────────────────────────
+- "steps" MUST be a JSON array of strings.
+- Each string = ONE atomic step.
+- No combined actions.
+- No hidden chain-of-thought.
+- If unclear, return an EMPTY array.
 
-            ────────────────────────────────────────
-            FINAL ANSWER RULES
-            ────────────────────────────────────────
-            - "final_answer" MUST be a concise, direct solution.
-            - No hedging, no speculation, no filler.
-            - If the problem is unsolvable with given information, explicitly say so.
+────────────────────────────────────────
+FINAL ANSWER RULES
+────────────────────────────────────────
+- Must be concise and direct.
+- No hedging.
+- If unsolvable, explicitly state that.
 
-            ────────────────────────────────────────
-            TOOL USAGE RULES
-            ────────────────────────────────────────
-            - Allowed tools: {tools_allowed}
-            - If no tools are required, return an EMPTY ARRAY.
-            - If tools are required:
-            - Each request must be explicit and minimal.
-            - Never hallucinate tool outputs.
-            - Do NOT execute tools unless explicitly instructed.
+────────────────────────────────────────
+TOOL USAGE RULES
+────────────────────────────────────────
+- Allowed tools: {tools_allowed}
+- If no tools are required → EMPTY array.
+- Never fabricate tool outputs.
 
-            ────────────────────────────────────────
-            INPUT METADATA (READ-ONLY)
-            ────────────────────────────────────────
-            Problem Route: {route}
-            Difficulty: {difficulty}
+────────────────────────────────────────
+INPUT METADATA (READ-ONLY)
+────────────────────────────────────────
+Route: {route}
+Difficulty: {difficulty}
 
-            Problem:
-            {problem_text}
+Problem:
+{problem_text}
 
-            Retrieved Context:
-            {context}
+Retrieved Context:
+{context}
 
-            ────────────────────────────────────────
-            EXACT OUTPUT FORMAT (NO DEVIATION)
-            ────────────────────────────────────────
-            {{
-            "final_answer": "string",
-            "steps": ["step 1", "step 2"],
-            "tool_requests": []
-            }}
+────────────────────────────────────────
+EXACT OUTPUT FORMAT
+────────────────────────────────────────
+{{
+  "final_answer": "string",
+  "steps": ["step 1", "step 2"],
+  "tool_requests": []
+}}
 """
 
     def solve(
@@ -107,13 +104,12 @@ class SolverAgent:
         rag_context: Optional[List[str]] = None
     ) -> Dict[str, Any]:
 
-        # 🚨 Hard stop for out-of-scope
+        # Hard stop: unsupported domain
         if route == "out_of_scope":
             return {
-                "status": "FAILED",
-                "reason": "Problem out of supported scope",
-                "final_answer": None,
-                "steps": []
+                "status": "CANDIDATE_FAILED",
+                "error": "Problem out of supported scope",
+                "solution": None
             }
 
         prompt = self._create_prompt(
@@ -124,80 +120,69 @@ class SolverAgent:
             rag_context
         )
 
-        # 🔹 Call LLM (wrapper contract)
         llm_response = self.llm.generate(prompt, temperature=0.2)
 
         if not llm_response.get("success"):
             return {
-                "status": "FAILED",
-                "reason": llm_response.get("error", "LLM call failed"),
-                "final_answer": None,
-                "steps": []
+                "status": "CANDIDATE_FAILED",
+                "error": llm_response.get("error", "LLM call failed"),
+                "solution": None
             }
 
         solution = llm_response.get("parsed_json")
 
         if not isinstance(solution, dict):
             return {
-                "status": "FAILED",
-                "reason": "LLM did not return valid JSON",
-                "final_answer": None,
-                "steps": []
+                "status": "CANDIDATE_FAILED",
+                "error": "LLM did not return valid JSON",
+                "solution": None
             }
 
-        # ---- REQUIRED KEYS VALIDATION ----
+        # Required keys check
         for key in ("final_answer", "steps", "tool_requests"):
             if key not in solution:
                 return {
-                    "status": "FAILED",
-                    "reason": f"Missing required key: {key}",
-                    "final_answer": None,
-                    "steps": []
+                    "status": "CANDIDATE_FAILED",
+                    "error": f"Missing required key: {key}",
+                    "solution": None
                 }
 
-        # ---- Normalize & Validate steps ----
+        # Normalize steps
         steps = solution["steps"]
-
         if isinstance(steps, str):
-            steps = [
-                s.strip("-• \n\t")
-                for s in steps.split("\n")
-                if s.strip()
-            ]
+            steps = [s.strip() for s in steps.split("\n") if s.strip()]
 
         if not isinstance(steps, list):
             return {
-                "status": "FAILED",
-                "reason": "Steps must be a list",
-                "final_answer": None,
-                "steps": []
+                "status": "CANDIDATE_FAILED",
+                "error": "Steps must be a list",
+                "solution": None
             }
 
-        # ---- Validate final_answer ----
         final_answer = solution["final_answer"]
-        if not isinstance(final_answer, str) or not final_answer.strip():
+        if not isinstance(final_answer, str):
             return {
-                "status": "FAILED",
-                "reason": "Final answer is empty or invalid",
-                "final_answer": None,
-                "steps": []
+                "status": "CANDIDATE_FAILED",
+                "error": "Final answer must be a string",
+                "solution": None
             }
 
-        # ---- Tool enforcement ----
+        # Tool validation
         used_tools = []
         for tool in solution.get("tool_requests", []):
             if tool not in tools_allowed:
                 return {
-                    "status": "FAILED",
-                    "reason": f"Unauthorized tool request: {tool}",
-                    "final_answer": None,
-                    "steps": []
+                    "status": "CANDIDATE_FAILED",
+                    "error": f"Unauthorized tool request: {tool}",
+                    "solution": None
                 }
             used_tools.append(tool)
 
         return {
-            "status": "SOLVED",
-            "final_answer": final_answer,
-            "steps": steps,
-            "used_tools": used_tools
+            "status": "CANDIDATE_GENERATED",
+            "solution": {
+                "final_answer": final_answer.strip(),
+                "steps": steps,
+                "used_tools": used_tools
+            }
         }
