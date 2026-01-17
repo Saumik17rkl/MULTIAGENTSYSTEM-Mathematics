@@ -7,7 +7,7 @@ from google import genai
 
 class GeminiClient:
     """
-    Stable Gemini client using google.genai (new SDK).
+    Gemini client using google.generativeai package.
     Contract:
     {
       success: bool,
@@ -43,7 +43,7 @@ class GeminiClient:
             parsed_json = None
             try:
                 parsed_json = json.loads(text)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, AttributeError):
                 pass
 
             return {
@@ -58,5 +58,5 @@ class GeminiClient:
                 "success": False,
                 "content": "",
                 "parsed_json": None,
-                "error": str(e)
+                "error": f"Gemini API error: {str(e)[:200]}"
             }
